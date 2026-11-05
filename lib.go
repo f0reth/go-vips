@@ -16,6 +16,10 @@ var (
 	libglib    uintptr
 	libVersion int   // major*10000 + minor*100 + micro
 	dynamicErr error // why the library cannot be used, if it cannot
+
+	// defaultConcurrency is the number of threads of libvips at startup: the VIPS_CONCURRENCY
+	// environment variable, or the number of CPUs.
+	defaultConcurrency int32
 )
 
 // GTypes of libvips, set by init.
@@ -55,6 +59,7 @@ func load() error {
 	if vips_init("go-vips") != 0 {
 		return fmt.Errorf("vips_init: %s", lastError())
 	}
+	defaultConcurrency = vips_concurrency_get()
 
 	typeImage = vips_image_get_type()
 	typeBlob = vips_blob_get_type()
@@ -132,6 +137,7 @@ var (
 	vips_error_buffer_copy          func() unsafe.Pointer
 	vips_error_clear                func()
 	vips_concurrency_set            func(n int32)
+	vips_concurrency_get            func() int32
 	vips_cache_set_max              func(n int32)
 	vips_cache_set_max_mem          func(bytes uint64)
 	vips_cache_set_max_files        func(n int32)
@@ -150,11 +156,14 @@ var (
 	vips_image_copy_memory          func(image unsafe.Pointer) unsafe.Pointer
 	vips_image_get_width            func(image unsafe.Pointer) int32
 	vips_image_get_height           func(image unsafe.Pointer) int32
+	vips_image_get_page_height      func(image unsafe.Pointer) int32
 	vips_image_get_bands            func(image unsafe.Pointer) int32
 	vips_image_get_format           func(image unsafe.Pointer) int32
 	vips_image_get_interpretation   func(image unsafe.Pointer) int32
 	vips_image_hasalpha             func(image unsafe.Pointer) int32
 	vips_image_get                  func(image unsafe.Pointer, name string, value *gValue) int32
+	vips_image_set_int              func(image unsafe.Pointer, name string, i int32)
+	vips_image_remove               func(image unsafe.Pointer, name string) int32
 	vips_image_get_fields           func(image unsafe.Pointer) unsafe.Pointer
 	vips_enum_nick                  func(enum uintptr, value int32) string
 	vips_enum_from_nick             func(domain string, enum uintptr, nick string) int32

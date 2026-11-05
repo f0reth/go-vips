@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"unsafe"
 )
 
@@ -46,7 +47,7 @@ func Call(name string, args Options) (Options, error) {
 		return nil, fmt.Errorf("vips: %s", lastError())
 	}
 
-	arguments := operationArguments(op)
+	arguments := operationArguments(name, op)
 	for k, x := range args {
 		if err := setArgument(op, arguments[strings.ReplaceAll(k, "-", "_")], x); err != nil {
 			g_object_unref(op)
@@ -75,7 +76,7 @@ func Call(name string, args Options) (Options, error) {
 		}
 
 		var v gValue
-		g_value_init(&v, g_param_spec_get_default_value(a.pspec).gType)
+		g_value_init(&v, a.gType)
 		g_object_get_property(op, a.name, &v)
 		x, err := fromValue(&v)
 		g_value_unset(&v)
@@ -121,10 +122,21 @@ type argument struct {
 	name  string         // GObject property name
 	flags int32          // VipsArgumentFlags
 	pspec unsafe.Pointer // GParamSpec
+	gType uintptr        // GType of the value
 }
 
-// operationArguments returns the arguments of the operation op by name, written with '_'.
-func operationArguments(op unsafe.Pointer) map[string]argument {
+// operations caches the arguments of the operations by name. They belong to the class of the
+// operation, which libvips never frees, and looking them up by name takes a lock of GObject shared
+// by all threads.
+var operations sync.Map // string → map[string]argument
+
+// operationArguments returns the arguments of the operation op named name by name, written with
+// '_'.
+func operationArguments(name string, op unsafe.Pointer) map[string]argument {
+	if m, ok := operations.Load(name); ok {
+		return m.(map[string]argument)
+	}
+
 	var names, flags unsafe.Pointer
 	var n int32
 	if vips_object_get_args(op, &names, &flags, &n) != 0 {
@@ -141,8 +153,10 @@ func operationArguments(op unsafe.Pointer) map[string]argument {
 			lastError()
 			continue
 		}
+		a.gType = g_param_spec_get_default_value(a.pspec).gType
 		m[strings.ReplaceAll(a.name, "-", "_")] = a
 	}
+	operations.Store(name, m)
 
 	return m
 }
@@ -158,7 +172,7 @@ func setArgument(op unsafe.Pointer, a argument, x any) error {
 	}
 
 	var v gValue
-	if err := toValue(&v, g_param_spec_get_default_value(a.pspec).gType, x); err != nil {
+	if err := toValue(&v, a.gType, x); err != nil {
 		return err
 	}
 	defer g_value_unset(&v)

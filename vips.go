@@ -26,9 +26,14 @@ func Version() string {
 // SetConcurrency sets the number of worker threads libvips uses to compute an image. 0 restores
 // the default: the VIPS_CONCURRENCY environment variable, or the number of CPUs.
 func SetConcurrency(n int) {
-	if dynamicErr == nil {
-		vips_concurrency_set(int32(n))
+	if dynamicErr != nil {
+		return
 	}
+	// vips_concurrency_set takes the current number for the default once it has been set.
+	if n < 1 {
+		n = int(defaultConcurrency)
+	}
+	vips_concurrency_set(int32(n))
 }
 
 // SetCacheMax sets the maximum number of operations kept in the libvips operation cache

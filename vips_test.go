@@ -35,7 +35,13 @@ func TestLibrary(t *testing.T) {
 	t.Logf("libvips %s", Version())
 
 	SetConcurrency(2)
+	if n := vips_concurrency_get(); n != 2 {
+		t.Errorf("SetConcurrency(2): %d threads", n)
+	}
 	SetConcurrency(0)
+	if n := vips_concurrency_get(); n != defaultConcurrency || n < 1 {
+		t.Errorf("SetConcurrency(0): %d threads, want the default %d", n, defaultConcurrency)
+	}
 	SetCacheMaxMem(100 << 20)
 	SetCacheMaxFiles(100)
 }

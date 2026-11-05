@@ -5,6 +5,7 @@ package vips
 import (
 	"bytes"
 	"image"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -273,6 +274,11 @@ func TestResizeAlpha(t *testing.T) {
 			}
 		})
 	}
+
+	// Resize premultiplies like the thumbnail operations: halving gives the same pixels.
+	if p := psnr(toImage(t, must(t)(logo.ThumbnailImage(256, 0, nil))), toImage(t, must(t)(logo.Resize(0.5, nil)))); !math.IsInf(p, 1) {
+		t.Errorf("Resize and ThumbnailImage: PSNR %.1f dB, want the same pixels", p)
+	}
 }
 
 func TestResizeOrientation(t *testing.T) {
@@ -523,17 +529,30 @@ func TestResizeLarge(t *testing.T) {
 func TestCopyMemory(t *testing.T) {
 	requireLibrary(t)
 
-	// The result of ThumbnailBuffer is computed while the JPEG is read, once only; its copy in
-	// memory can be saved in several formats.
+	// The results of Thumbnail and ThumbnailBuffer are computed in memory: they can be saved in
+	// several formats, and the images computed from them use all the threads.
 	thumb := must(t)(ThumbnailBuffer(testJPEG, 200, 0, nil))
-	mem := must(t)(thumb.CopyMemory())
-	checkSize(t, mem, 200, 133)
+	checkSaves(t, thumb, 200, 133)
+	if _, err := thumb.Get(metaConcurrency); err == nil {
+		t.Errorf("ThumbnailBuffer: the result has the field %q", metaConcurrency)
+	}
+
+	// An image loaded with the sequential access is computed while the JPEG is read, once only;
+	// its copy in memory can be saved several times.
+	loaded := must(t)(LoadBuffer(testJPEG, Options{"access": "sequential"}))
+	checkSaves(t, must(t)(loaded.CopyMemory()), 768, 512)
+}
+
+// checkSaves checks that im of size w x h can be saved in several formats.
+func checkSaves(t *testing.T, im *Image, w, h int) {
+	t.Helper()
+
 	for _, suffix := range []string{".jpg", ".png", ".webp", ".jpg"} {
-		buf, err := mem.SaveBuffer(suffix, nil)
+		buf, err := im.SaveBuffer(suffix, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		checkSize(t, must(t)(LoadBuffer(buf, nil)), 200, 133)
+		checkSize(t, must(t)(LoadBuffer(buf, nil)), w, h)
 	}
-	toImage(t, mem)
+	toImage(t, im)
 }

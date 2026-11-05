@@ -127,8 +127,8 @@ func withArgs(opts, args Options) Options {
 }
 
 // CopyMemory returns a copy of im computed in memory. The images loaded with the "sequential"
-// access, such as the results of Thumbnail and ThumbnailBuffer, are computed while their file is
-// read, once only: a copy in memory can be saved or processed several times.
+// access are computed while their file is read, once only: a copy in memory can be saved or
+// processed several times.
 func (im *Image) CopyMemory() (*Image, error) {
 	defer runtime.KeepAlive(im)
 
@@ -153,6 +153,14 @@ func (im *Image) Height() int {
 	defer runtime.KeepAlive(im)
 
 	return int(vips_image_get_height(im.ptr()))
+}
+
+// pageHeight returns the height of a page of im: the "page-height" field if it divides the height,
+// the height otherwise.
+func (im *Image) pageHeight() int {
+	defer runtime.KeepAlive(im)
+
+	return int(vips_image_get_page_height(im.ptr()))
 }
 
 // Bands returns the number of bands (channels) of im.

@@ -193,8 +193,7 @@ const maxCoord = 10000000
 //	"option_string"   options of the loader, such as "n=-1" to resize all the frames of an animation
 //	"output_profile"  ICC profile to convert to, such as "srgb"
 //
-// The result is computed while the file is read, once only: use CopyMemory to save it several
-// times.
+// The result is computed in memory before Thumbnail returns, so it can be saved several times.
 func Thumbnail(filename string, width, height int, opts Options) (*Image, error) {
 	args, err := thumbnailArgs(width, height, opts)
 	if err != nil {
@@ -202,7 +201,7 @@ func Thumbnail(filename string, width, height int, opts Options) (*Image, error)
 	}
 	args["filename"] = filename
 
-	return callImage("thumbnail", opts, args)
+	return computeThumbnail(callImage("thumbnail", opts, args))
 }
 
 // ThumbnailBuffer is Thumbnail for the image file contained in buf.
@@ -213,7 +212,43 @@ func ThumbnailBuffer(buf []byte, width, height int, opts Options) (*Image, error
 	}
 	args["buffer"] = buf
 
-	return callImage("thumbnail_buffer", opts, args)
+	return computeThumbnail(callImage("thumbnail_buffer", opts, args))
+}
+
+// thumbnailThreads is the number of threads computing the results of Thumbnail and
+// ThumbnailBuffer. Their file is decoded in order, by one thread at a time that the others wait
+// for: a second thread resizing while the file is decoded is the fastest, for one thumbnail as for
+// many in parallel.
+const thumbnailThreads = 2
+
+// metaConcurrency is the metadata field holding the number of threads libvips computes an image
+// with (VIPS_META_CONCURRENCY).
+const metaConcurrency = "concurrency"
+
+// computeThumbnail returns thumb, the result of the thumbnail or thumbnail_buffer operation,
+// computed in memory by thumbnailThreads threads at most. It closes thumb.
+func computeThumbnail(thumb *Image, err error) (*Image, error) {
+	if err != nil {
+		return nil, err
+	}
+	defer thumb.Close()
+
+	// The field is set on a copy, which the operation cache does not share.
+	c, err := thumb.Copy(nil)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	vips_image_set_int(c.ptr(), metaConcurrency, min(thumbnailThreads, vips_concurrency_get()))
+
+	m, err := c.CopyMemory()
+	if err != nil {
+		return nil, err
+	}
+	// The copy in memory is a new image: the images computed from it use all the threads.
+	vips_image_remove(m.ptr(), metaConcurrency)
+
+	return m, nil
 }
 
 // ThumbnailImage is Thumbnail for an image already loaded, which it can read several times.
@@ -252,25 +287,33 @@ func isNick(x any, nick string) bool {
 
 // Resize resizes im by scale. Options include "vscale" (vertical scale, default scale) and
 // "kernel". Unlike the libvips resize operation alone, it premultiplies the alpha channel while
-// resizing, so that the color of transparent pixels does not darken the edges. ThumbnailImage
-// resizes to a size in pixels.
+// resizing, like the thumbnail operations, so that the color of transparent pixels does not darken
+// the edges. ThumbnailImage resizes to a size in pixels.
 //
 // Resize returns an error for multi-page images (animations), whose page height it would not
 // resize: use ThumbnailImage.
 func (im *Image) Resize(scale float64, opts Options) (*Image, error) {
-	if ph, err := im.Get("page-height"); err == nil && ph.(int) < im.Height() {
+	if im.pageHeight() < im.Height() {
 		return nil, errors.New("vips: resize: multi-page images must be resized with ThumbnailImage")
 	}
 	if !im.HasAlpha() {
 		return callImage("resize", opts, Options{"in": im, "scale": scale})
 	}
 
+	// Like the thumbnail operations, the premultiplied image is cast back to the format of im:
+	// resizing it is much faster than in float (vectorized for 8-bit images).
+	format := im.Format()
 	premultiplied, err := callImage("premultiply", nil, Options{"in": im})
 	if err != nil {
 		return nil, err
 	}
 	defer premultiplied.Close()
-	resized, err := callImage("resize", opts, Options{"in": premultiplied, "scale": scale})
+	cast, err := premultiplied.Cast(format, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer cast.Close()
+	resized, err := callImage("resize", opts, Options{"in": cast, "scale": scale})
 	if err != nil {
 		return nil, err
 	}
@@ -281,7 +324,7 @@ func (im *Image) Resize(scale float64, opts Options) (*Image, error) {
 	}
 	defer unpremultiplied.Close()
 
-	return unpremultiplied.Cast(im.Format(), nil)
+	return unpremultiplied.Cast(format, nil)
 }
 
 // ExtractArea returns the area of im of size width x height at (left, top).
