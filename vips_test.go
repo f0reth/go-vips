@@ -430,6 +430,23 @@ func TestGoImage(t *testing.T) {
 		{"Paletted", paletted, 4, InterpretationSRGB, &image.NRGBA{}},
 		{"SubImage", noise.SubImage(image.Rect(5, 7, 30, 20)), 4, InterpretationSRGB, &image.NRGBA{}},
 	}
+	// YCbCr images of every subsampling ratio, cut at odd coordinates.
+	for _, ratio := range []image.YCbCrSubsampleRatio{
+		image.YCbCrSubsampleRatio444, image.YCbCrSubsampleRatio422, image.YCbCrSubsampleRatio420,
+		image.YCbCrSubsampleRatio440, image.YCbCrSubsampleRatio411, image.YCbCrSubsampleRatio410,
+	} {
+		m := image.NewYCbCr(image.Rect(-3, -5, 58, 32), ratio)
+		for i, s := range [][]byte{m.Y, m.Cb, m.Cr} {
+			copy(s, noiseImage(61, 37, uint64(i+3), true).Pix)
+		}
+		tests = append(tests, struct {
+			name  string
+			m     image.Image
+			bands int
+			space Interpretation
+			got   image.Image
+		}{"YCbCr/" + ratio.String(), m.SubImage(image.Rect(-1, -3, 51, 29)), 3, InterpretationSRGB, &image.RGBA{}})
+	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -473,6 +490,11 @@ func TestToImage(t *testing.T) {
 		gray.Pix[i] = uint8(i * 2)
 	}
 	g := mustFromImage(t, gray)
+	gray16 := image.NewGray16(gray.Rect)
+	for i := range gray16.Pix {
+		gray16.Pix[i] = uint8(i * 7)
+	}
+	g16 := mustFromImage(t, gray16)
 	src := mustLoad(t)
 	want := decodedJPEG(t)
 
@@ -486,6 +508,14 @@ func TestToImage(t *testing.T) {
 			m := image.NewNRGBA(gray.Rect)
 			for i, v := range gray.Pix {
 				copy(m.Pix[4*i:], []byte{v, v, v, 128})
+			}
+			return m
+		}()},
+		{"grey16+alpha", must(t)(callImage("bandjoin_const", nil, Options{"in": g16, "c": 1000})), func() image.Image {
+			m := image.NewNRGBA64(gray.Rect)
+			for i := range gray16.Pix[:len(gray16.Pix)/2] {
+				v := gray16.Gray16At(i%16, i/16).Y
+				m.SetNRGBA64(i%16, i/16, color.NRGBA64{v, v, v, 1000})
 			}
 			return m
 		}()},

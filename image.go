@@ -9,6 +9,7 @@ import (
 	"image/draw"
 	"maps"
 	"runtime"
+	"slices"
 	"unsafe"
 )
 
@@ -245,50 +246,29 @@ func FromImage(m image.Image) (*Image, error) {
 		return nil, errors.New("vips: empty image")
 	}
 
-	// pix holds the rows of channels samples of depth bytes per pixel.
-	var pix []byte
-	var stride, channels, depth int
-	var opaque bool
-	var space Interpretation
-	switch m.ColorModel() {
-	case color.GrayModel:
-		g := convert(m, image.NewGray)
-		pix, stride, channels, depth, opaque, space = g.Pix, g.Stride, 1, 1, true, InterpretationBW
-	case color.Gray16Model:
-		g := convert(m, image.NewGray16)
-		pix, stride, channels, depth, opaque, space = g.Pix, g.Stride, 1, 2, true, InterpretationGrey16
-	case color.RGBA64Model, color.NRGBA64Model:
-		n := convert(m, image.NewNRGBA64)
-		pix, stride, channels, depth, opaque, space = n.Pix, n.Stride, 4, 2, n.Opaque(), InterpretationRGB16
-	default:
-		n := toNRGBA(m)
-		pix, stride, channels, depth, opaque, space = n.Pix, n.Stride, 4, 1, n.Opaque(), InterpretationSRGB
-	}
-
-	bands := channels
-	if channels == 4 && opaque {
-		bands = 3
-	}
-	// Pack the rows and drop the alpha channel of opaque images.
-	px := bands * depth
-	data := make([]byte, w*h*px)
-	for y := range h {
-		src, dst := pix[y*stride:], data[y*w*px:(y+1)*w*px]
-		if bands == channels {
-			copy(dst, src)
-			continue
-		}
-		for x := range w {
-			copy(dst[x*px:(x+1)*px], src[x*channels*depth:])
-		}
-	}
-
-	format := int32(formatUchar)
-	if depth == 2 {
-		format = formatUshort
-		// libvips stores 16-bit samples in native byte order, the image package in big-endian.
-		for i := 0; i < len(data); i += 2 {
-			binary.NativeEndian.PutUint16(data[i:], binary.BigEndian.Uint16(data[i:]))
+	// data holds the w x h pixels of bands samples, of 8 bits or 16 bits in native byte order.
+	var data []byte
+	var bands int
+	format, space := int32(formatUchar), InterpretationSRGB
+	if y, ok := m.(*image.YCbCr); ok {
+		data, bands = ycbcrToRGB(y), 3
+	} else {
+		switch m.ColorModel() {
+		case color.GrayModel:
+			g := convert(m, image.NewGray)
+			data, bands, space = pack(g.Pix, g.Stride, w, h, 1, 1, 1), 1, InterpretationBW
+		case color.Gray16Model:
+			g := convert(m, image.NewGray16)
+			data, bands, space = pack(g.Pix, g.Stride, w, h, 1, 1, 2), 1, InterpretationGrey16
+			format = formatUshort
+		case color.RGBA64Model, color.NRGBA64Model:
+			n := convert(m, image.NewNRGBA64)
+			bands = alphaBands(n.Opaque())
+			data, format, space = pack(n.Pix, n.Stride, w, h, 4, bands, 2), formatUshort, InterpretationRGB16
+		default:
+			n := toNRGBA(m)
+			bands = alphaBands(n.Opaque())
+			data = pack(n.Pix, n.Stride, w, h, 4, bands, 1)
 		}
 	}
 
@@ -297,9 +277,23 @@ func FromImage(m image.Image) (*Image, error) {
 		return nil, fmt.Errorf("vips: from image: %s", lastError())
 	}
 	im := newImage(p)
+	// libvips guesses the interpretation from the bands and the format: right for 8-bit gray and
+	// RGB ("b-w" and "srgb"), "multiband" or "b-w" otherwise.
+	if im.Interpretation() == space {
+		return im, nil
+	}
 	defer im.Close()
 
 	return im.Copy(Options{"interpretation": space})
+}
+
+// alphaBands returns the number of bands of a color image: 3 if it is opaque, 4 otherwise.
+func alphaBands(opaque bool) int {
+	if opaque {
+		return 3
+	}
+
+	return 4
 }
 
 // convert returns m as a T, converting it with newImage and draw.Draw if it is not one.
@@ -323,6 +317,79 @@ func toNRGBA(m image.Image) *image.NRGBA {
 	return convert(m, image.NewNRGBA)
 }
 
+// ycbcrToRGB returns the pixels of m as 8-bit RGB samples, converted like color.YCbCrToRGB.
+func ycbcrToRGB(m *image.YCbCr) []byte {
+	r := m.Rect
+	w := r.Dx()
+	// The offset of the chroma samples of every subsampling ratio is the sum of an offset depending
+	// on the row and one depending on the column: cx holds the latter.
+	cx := make([]int, w)
+	for i := range cx {
+		cx[i] = m.COffset(r.Min.X+i, r.Min.Y) - m.COffset(r.Min.X, r.Min.Y)
+	}
+
+	data := make([]byte, 3*w*r.Dy())
+	for y := r.Min.Y; y < r.Max.Y; y++ {
+		ys := m.Y[m.YOffset(r.Min.X, y):][:w]
+		ci := m.COffset(r.Min.X, y)
+		cbs, crs := m.Cb[ci:], m.Cr[ci:]
+		dst := data[3*w*(y-r.Min.Y):][:3*w]
+		for i, yv := range ys {
+			// color.YCbCrToRGB, which is not inlined.
+			yy := int32(yv) * 0x10101
+			cb := int32(cbs[cx[i]]) - 128
+			cr := int32(crs[cx[i]]) - 128
+			d := dst[3*i : 3*i+3 : 3*i+3]
+			d[0] = clamp16(yy + 91881*cr)
+			d[1] = clamp16(yy - 22554*cb - 46802*cr)
+			d[2] = clamp16(yy + 116130*cb)
+		}
+	}
+
+	return data
+}
+
+// clamp16 returns v >> 16 clamped to [0, 255].
+func clamp16(v int32) uint8 {
+	if uint32(v)&0xff000000 == 0 {
+		return uint8(v >> 16)
+	}
+
+	return uint8(^(v >> 31))
+}
+
+// pack returns the w x h pixels of pix, rows of stride bytes of pixels of channels big-endian
+// samples of depth bytes, as unpadded rows of the first bands samples in native byte order. It
+// returns pix itself if it already has this layout.
+func pack(pix []byte, stride, w, h, channels, bands, depth int) []byte {
+	in, out := channels*depth, bands*depth
+	if depth == 1 && channels == bands && stride == w*out {
+		return pix[:h*stride]
+	}
+
+	data := make([]byte, w*h*out)
+	for y := range h {
+		src, dst := pix[y*stride:y*stride+w*in], data[y*w*out:(y+1)*w*out]
+		switch {
+		case depth == 2:
+			for x := range w {
+				s, d := src[x*in:], dst[x*out:]
+				for c := range bands {
+					binary.NativeEndian.PutUint16(d[2*c:], binary.BigEndian.Uint16(s[2*c:]))
+				}
+			}
+		case channels == bands:
+			copy(dst, src)
+		default: // 4 to 3 samples of 8 bits
+			for s, d := 0, 0; d < len(dst); s, d = s+4, d+3 {
+				dst[d], dst[d+1], dst[d+2] = src[s], src[s+1], src[s+2]
+			}
+		}
+	}
+
+	return data
+}
+
 // ToImage returns im as an image.Image of the image package, converted to sRGB or gray:
 // *image.Gray or *image.Gray16 for gray images without alpha, *image.RGBA or *image.RGBA64 for
 // images without alpha, *image.NRGBA or *image.NRGBA64 otherwise. 16-bit images ("rgb16" and
@@ -332,28 +399,42 @@ func (im *Image) ToImage() (image.Image, error) {
 	gray := space == InterpretationBW || space == InterpretationGrey16
 	deep := space == InterpretationRGB16 || space == InterpretationGrey16
 
-	target, format := InterpretationSRGB, BandFormatUchar
+	target, color, format := InterpretationSRGB, InterpretationSRGB, BandFormatUchar
 	switch {
 	case gray && deep:
-		target, format = InterpretationGrey16, BandFormatUshort
+		target, color, format = InterpretationGrey16, InterpretationRGB16, BandFormatUshort
 	case gray:
 		target = InterpretationBW
 	case deep:
-		target, format = InterpretationRGB16, BandFormatUshort
+		target, color, format = InterpretationRGB16, InterpretationRGB16, BandFormatUshort
 	}
 
-	c, err := im.Colourspace(target, nil)
-	if err != nil {
-		return nil, err
+	// c is im converted step by step; steps holds the images to close.
+	c := im
+	var steps []*Image
+	defer func() {
+		for _, s := range steps {
+			s.Close()
+		}
+	}()
+	step := func(out *Image, err error) error {
+		if err == nil {
+			steps = append(steps, out)
+			c = out
+		}
+
+		return err
 	}
-	defer c.Close()
-	if c.Format() != format {
-		cast, err := c.Cast(format, nil)
-		if err != nil {
+
+	if space != target {
+		if err := step(c.Colourspace(target, nil)); err != nil {
 			return nil, err
 		}
-		defer cast.Close()
-		c = cast
+	}
+	if c.Format() != format {
+		if err := step(c.Cast(format, nil)); err != nil {
+			return nil, err
+		}
 	}
 
 	colors := 3
@@ -364,19 +445,41 @@ func (im *Image) ToImage() (image.Image, error) {
 	if bands != colors && bands != colors+1 {
 		return nil, fmt.Errorf("vips: cannot convert a %d-band %s image", bands, target)
 	}
+	// The image package has no gray image with alpha: libvips converts it to color.
+	if gray && bands == 2 {
+		if err := step(c.Colourspace(color, nil)); err != nil {
+			return nil, err
+		}
+	}
 
-	data, err := c.writeToMemory()
+	data, err := c.writeToMemory(deep)
 	if err != nil {
 		return nil, err
 	}
 
-	return goImage(data, c.Width(), c.Height(), bands, deep), nil
+	r := image.Rect(0, 0, c.Width(), c.Height())
+	switch {
+	case bands == 1 && !deep:
+		return &image.Gray{Pix: data, Stride: r.Dx(), Rect: r}, nil
+	case bands == 1:
+		return &image.Gray16{Pix: data, Stride: 2 * r.Dx(), Rect: r}, nil
+	case bands == 3 && !deep:
+		return &image.RGBA{Pix: data, Stride: 4 * r.Dx(), Rect: r}, nil
+	case bands == 3:
+		return &image.RGBA64{Pix: data, Stride: 8 * r.Dx(), Rect: r}, nil
+	case !deep:
+		return &image.NRGBA{Pix: data, Stride: 4 * r.Dx(), Rect: r}, nil
+	}
+
+	return &image.NRGBA64{Pix: data, Stride: 8 * r.Dx(), Rect: r}, nil
 }
 
-// writeToMemory returns the pixels of im.
-func (im *Image) writeToMemory() ([]byte, error) {
+// writeToMemory returns the pixels of im as samples of the image package: 16-bit samples (if deep)
+// in big-endian order, and RGB pixels of 3 samples with an opaque alpha sample added.
+func (im *Image) writeToMemory(deep bool) ([]byte, error) {
 	defer runtime.KeepAlive(im)
 
+	rgb := im.Bands() == 3
 	var n uint64
 	p := vips_image_write_to_memory(im.ptr(), &n)
 	if p == nil {
@@ -384,58 +487,33 @@ func (im *Image) writeToMemory() ([]byte, error) {
 	}
 	defer g_free(p)
 
-	return cBytes(p, int(n)), nil
-}
-
-// goImage returns the w x h pixels data of bands 8-bit or 16-bit (if deep) samples as an image of
-// the image package.
-func goImage(data []byte, w, h, bands int, deep bool) image.Image {
-	r := image.Rect(0, 0, w, h)
-	depth := 1
-	if deep {
-		depth = 2
-		for i := 0; i < len(data); i += 2 {
-			binary.BigEndian.PutUint16(data[i:], binary.NativeEndian.Uint16(data[i:]))
-		}
-	}
-
+	src := cSlice[byte](p, int(n))
 	switch {
-	case bands == 1 && !deep:
-		return &image.Gray{Pix: data, Stride: w, Rect: r}
-	case bands == 1:
-		return &image.Gray16{Pix: data, Stride: 2 * w, Rect: r}
-	case bands == 4 && !deep:
-		return &image.NRGBA{Pix: data, Stride: 4 * w, Rect: r}
-	case bands == 4:
-		return &image.NRGBA64{Pix: data, Stride: 8 * w, Rect: r}
-	}
-
-	// Expand gray with alpha and RGB to RGBA, where -1 is an opaque alpha.
-	channels := [4]int{0, 0, 0, 1}
-	if bands == 3 {
-		channels = [4]int{0, 1, 2, -1}
-	}
-	pix := make([]byte, w*h*4*depth)
-	for i := range w * h {
-		for c, s := range channels {
-			for d := range depth {
-				v := byte(0xff)
-				if s >= 0 {
-					v = data[(i*bands+s)*depth+d]
-				}
-				pix[(i*4+c)*depth+d] = v
-			}
+	case !rgb && !deep:
+		return slices.Clone(src), nil
+	case !rgb:
+		data := make([]byte, len(src))
+		for i := 0; i < len(src); i += 2 {
+			binary.BigEndian.PutUint16(data[i:], binary.NativeEndian.Uint16(src[i:]))
 		}
-	}
-
-	switch {
-	case bands == 3 && !deep:
-		return &image.RGBA{Pix: pix, Stride: 4 * w, Rect: r}
-	case bands == 3:
-		return &image.RGBA64{Pix: pix, Stride: 8 * w, Rect: r}
+		return data, nil
 	case !deep:
-		return &image.NRGBA{Pix: pix, Stride: 4 * w, Rect: r}
+		data := make([]byte, len(src)/3*4)
+		for s, d := 0, 0; s < len(src); s, d = s+3, d+4 {
+			in, out := src[s:s+3:s+3], data[d:d+4:d+4]
+			out[0], out[1], out[2], out[3] = in[0], in[1], in[2], 0xff
+		}
+		return data, nil
 	}
 
-	return &image.NRGBA64{Pix: pix, Stride: 8 * w, Rect: r}
+	data := make([]byte, len(src)/6*8)
+	for s, d := 0, 0; s < len(src); s, d = s+6, d+8 {
+		in, out := src[s:s+6:s+6], data[d:d+8:d+8]
+		binary.BigEndian.PutUint16(out[0:], binary.NativeEndian.Uint16(in[0:]))
+		binary.BigEndian.PutUint16(out[2:], binary.NativeEndian.Uint16(in[2:]))
+		binary.BigEndian.PutUint16(out[4:], binary.NativeEndian.Uint16(in[4:]))
+		out[6], out[7] = 0xff, 0xff
+	}
+
+	return data, nil
 }
